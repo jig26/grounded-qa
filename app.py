@@ -14,78 +14,92 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------- Models ---------------- #
 
 class Chunk(BaseModel):
     chunk_id: str
     text: str
 
-
 class Query(BaseModel):
     question: str
     chunks: List[Chunk]
 
+# ---------------- Helpers ---------------- #
+
+STOPWORDS = {
+    "what","which","when","where","who","why","how",
+    "is","are","was","were","do","does","did",
+    "the","a","an","of","to","in","on","for","and",
+    "or","with","by","from","as","at","be","this",
+    "that","these","those"
+}
 
 def tokenize(text: str):
-    return set(re.findall(r"\w+", text.lower()))
+    return re.findall(r"\w+", text.lower())
 
+# ---------------- Routes ---------------- #
 
 @app.get("/")
-def root():
+def home():
     return {"status": "running"}
-
 
 @app.post("/grounded-answer")
 def grounded_answer(req: Query):
 
-    if not req.question.strip() or len(req.chunks) == 0:
+    if not req.question.strip():
         return {
             "answer": "I don't know",
             "citations": [],
             "confidence": 0.0,
-            "answerable": False,
+            "answerable": False
         }
 
-    qwords = tokenize(req.question)
+    if len(req.chunks) == 0:
+        return {
+            "answer": "I don't know",
+            "citations": [],
+            "confidence": 0.0,
+            "answerable": False
+        }
 
-    scored = []
+    qwords = set(tokenize(req.question)) - STOPWORDS
+
+    best_score = 0
+    best_sentence = None
+    best_chunk = None
 
     for chunk in req.chunks:
-        words = tokenize(chunk.text)
-        overlap = len(qwords & words)
 
-        if overlap > 0:
-            scored.append((overlap, chunk))
+        sentences = re.split(r'(?<=[.!?])\s+', chunk.text)
 
-    if not scored:
+        for sentence in sentences:
+
+            swords = set(tokenize(sentence))
+
+            score = len(qwords & swords)
+
+            if score > best_score:
+                best_score = score
+                best_sentence = sentence.strip()
+                best_chunk = chunk
+
+    # Reject weak matches
+    if best_score < 2:
         return {
             "answer": "I don't know",
             "citations": [],
             "confidence": 0.2,
-            "answerable": False,
+            "answerable": False
         }
-
-    scored.sort(reverse=True, key=lambda x: x[0])
-
-    best_score = scored[0][0]
-
-    citations = []
-    answer_parts = []
-
-    for score, chunk in scored:
-        if score >= max(1, best_score - 1):
-            citations.append(chunk.chunk_id)
-            answer_parts.append(chunk.text)
-
-    answer = " ".join(dict.fromkeys(answer_parts))
 
     confidence = min(
         0.99,
-        round(best_score / max(len(qwords), 1) + 0.35, 2),
+        round(0.5 + best_score / max(len(qwords), 1), 2)
     )
 
     return {
-        "answer": answer,
-        "citations": citations,
+        "answer": best_sentence,
+        "citations": [best_chunk.chunk_id],
         "confidence": confidence,
-        "answerable": True,
+        "answerable": True
     }

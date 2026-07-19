@@ -64,26 +64,17 @@ def grounded_answer(req: Query):
 
     qwords = set(tokenize(req.question)) - STOPWORDS
 
-    best_score = 0
-    best_sentence = None
     best_chunk = None
+    best_score = 0
 
     for chunk in req.chunks:
+        words = set(tokenize(chunk.text))
+        score = len(qwords & words)
 
-        sentences = re.split(r'(?<=[.!?])\s+', chunk.text)
+        if score > best_score:
+            best_score = score
+            best_chunk = chunk
 
-        for sentence in sentences:
-
-            swords = set(tokenize(sentence))
-
-            score = len(qwords & swords)
-
-            if score > best_score:
-                best_score = score
-                best_sentence = sentence.strip()
-                best_chunk = chunk
-
-    # Reject weak matches
     if best_score < 2:
         return {
             "answer": "I don't know",
@@ -92,13 +83,13 @@ def grounded_answer(req: Query):
             "answerable": False
         }
 
-    confidence = min(
-        0.99,
-        round(0.5 + best_score / max(len(qwords), 1), 2)
+    confidence = round(
+        min(0.99, 0.5 + best_score / max(len(qwords), 1)),
+        2
     )
 
     return {
-        "answer": best_sentence,
+        "answer": best_chunk.text,
         "citations": [best_chunk.chunk_id],
         "confidence": confidence,
         "answerable": True

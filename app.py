@@ -102,8 +102,21 @@ def split_question_fragments(question: str, entity_tokens):
 
 def build_candidates(qweights, chunks):
     """Score every sentence of every chunk against a given keyword-weight
-    map, returning candidates with any overlap at all."""
+    map, returning candidates with any overlap at all.
+
+    A sentence that only shares the question's subject entity (e.g. a
+    capitalized proper noun / acronym like "FAISS") but none of the
+    question's other content words is NOT treated as a real match when
+    the question has such content words to begin with. Otherwise any
+    sentence that merely mentions the subject -- regardless of whether it
+    states the fact being asked about -- can out-score the 0.34 threshold
+    purely off the entity's 2x weight, producing a confident answer to a
+    question the chunk never actually addresses (e.g. "FAISS is a popular
+    vector search library" does not say what language FAISS is written
+    in, even though it mentions "FAISS")."""
     qwords = set(qweights.keys())
+    entity_toks = {w for w, wt in qweights.items() if wt > 1.0}
+    non_entity_toks = qwords - entity_toks
     total_weight = sum(qweights.values()) or 1.0
     candidates = []
     for chunk in chunks:
@@ -114,14 +127,21 @@ def build_candidates(qweights, chunks):
         for sent in split_sentences(text):
             swords = set(tokenize(sent))
             matched = qwords & swords
-            if matched:
-                weighted_score = sum(qweights[w] for w in matched)
-                candidates.append({
-                    "chunk_id": chunk_id,
-                    "sentence": sent,
-                    "matched": matched,
-                    "score": weighted_score / total_weight,
-                })
+            if not matched:
+                continue
+            # Require the sentence to hit at least one non-entity content
+            # word when the question has any -- an entity-only overlap
+            # means "same topic" but not necessarily "answers the fact
+            # asked for".
+            if non_entity_toks and not (matched & non_entity_toks):
+                continue
+            weighted_score = sum(qweights[w] for w in matched)
+            candidates.append({
+                "chunk_id": chunk_id,
+                "sentence": sent,
+                "matched": matched,
+                "score": weighted_score / total_weight,
+            })
     candidates.sort(key=lambda c: (-c["score"], len(c["sentence"])))
     return candidates
 

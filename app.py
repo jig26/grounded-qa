@@ -4,6 +4,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import re
+import json
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("grounded-qa")
 
 app = FastAPI(title="Grounded QA API")
 
@@ -89,23 +94,30 @@ async def grounded_answer(request: Request):
     try:
         raw = await request.json()
     except Exception:
+        logger.info("REQUEST_BODY_UNPARSEABLE")
         return JSONResponse(content=unanswerable(0.0))
+
+    logger.info("INCOMING_REQUEST: %s", json.dumps(raw)[:4000])
+
+    def respond(payload):
+        logger.info("OUTGOING_RESPONSE for question=%r: %s", raw.get('question') if isinstance(raw, dict) else None, json.dumps(payload))
+        return JSONResponse(content=payload)
 
     try:
         req = Query(**raw) if isinstance(raw, dict) else Query()
     except Exception:
-        return JSONResponse(content=unanswerable(0.0))
+        return respond(unanswerable(0.0))
 
     question = (req.question or "").strip()
     chunks = req.chunks or []
 
     if not question or not chunks:
-        return JSONResponse(content=unanswerable(0.0))
+        return respond(unanswerable(0.0))
 
     qweights = weighted_keywords(question)
     if not qweights:
         # Question had no meaningful (non-stopword) terms to ground against
-        return JSONResponse(content=unanswerable(0.0))
+        return respond(unanswerable(0.0))
     qwords = set(qweights.keys())
     total_weight = sum(qweights.values())
 
@@ -129,7 +141,7 @@ async def grounded_answer(request: Request):
                 })
 
     if not candidates:
-        return JSONResponse(content=unanswerable(0.2))
+        return respond(unanswerable(0.2))
 
     # Sort by strength of match (most weighted keyword coverage first, ties
     # broken by shorter/tighter sentence so we don't drag in extra
@@ -147,9 +159,13 @@ async def grounded_answer(request: Request):
 
     ranked_chunks = sorted(by_chunk.values(), key=lambda c: -c["score"])
     top_score = ranked_chunks[0]["score"]
+    logger.info(
+        "CHUNK_SCORES: %s",
+        json.dumps([{"chunk_id": c["chunk_id"], "score": round(c["score"], 3), "sentence": c["sentence"][:80]} for c in ranked_chunks])
+    )
 
     if top_score < 0.34:
-        return JSONResponse(content=unanswerable(0.2))
+        return respond(unanswerable(0.2))
 
     # Primary source: the single best-supported chunk. Pull in every
     # sentence from THAT chunk (and only that chunk) that also has decent
@@ -193,7 +209,7 @@ async def grounded_answer(request: Request):
     coverage_ratio = sum(qweights[w] for w in covered) / total_weight
     confidence = round(min(0.99, 0.5 + 0.49 * coverage_ratio), 2)
 
-    return JSONResponse(content={
+    return respond({
         "answer": answer_text,
         "citations": citations,
         "confidence": confidence,

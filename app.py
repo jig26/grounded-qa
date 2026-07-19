@@ -43,6 +43,9 @@ STOPWORDS = {
 
 WORD_RE = re.compile(r"\b[A-Za-z0-9]+\b")
 SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+FRAGMENT_SPLIT_RE = re.compile(r"\s+and\s+", re.IGNORECASE)
+
+MATCH_THRESHOLD = 0.34
 
 
 def tokenize(text: str):
@@ -70,6 +73,57 @@ def split_sentences(text: str):
         return []
     parts = SENT_SPLIT_RE.split(text.strip())
     return [p.strip() for p in parts if p.strip()]
+
+
+def split_question_fragments(question: str, entity_tokens):
+    """Split a compound question ('X, and who did Y?') into independent
+    sub-questions. Each fragment inherits the entity tokens (acronyms /
+    proper nouns) found anywhere in the full question, since a later
+    fragment usually refers back to the same subject via a pronoun
+    ('...and who created it?') rather than repeating the name."""
+    raw_parts = [p.strip() for p in FRAGMENT_SPLIT_RE.split(question) if p.strip()]
+    if len(raw_parts) < 2:
+        return [question]
+
+    fragments = []
+    for part in raw_parts:
+        part_weights = weighted_keywords(part)
+        # Fragment must contribute at least one non-entity content word to
+        # count as its own sub-question (otherwise it's likely just part of
+        # a noun list like "cranes and forklifts" inside one clause, not a
+        # true second question) -- but we still search it either way.
+        for ent in entity_tokens:
+            part_weights.setdefault(ent, 2.0)
+        if part_weights:
+            fragments.append(part_weights)
+
+    return fragments if len(fragments) >= 2 else [question]
+
+
+def build_candidates(qweights, chunks):
+    """Score every sentence of every chunk against a given keyword-weight
+    map, returning candidates with any overlap at all."""
+    qwords = set(qweights.keys())
+    total_weight = sum(qweights.values()) or 1.0
+    candidates = []
+    for chunk in chunks:
+        chunk_id = getattr(chunk, "chunk_id", None)
+        text = getattr(chunk, "text", "") or ""
+        if not chunk_id or not text.strip():
+            continue
+        for sent in split_sentences(text):
+            swords = set(tokenize(sent))
+            matched = qwords & swords
+            if matched:
+                weighted_score = sum(qweights[w] for w in matched)
+                candidates.append({
+                    "chunk_id": chunk_id,
+                    "sentence": sent,
+                    "matched": matched,
+                    "score": weighted_score / total_weight,
+                })
+    candidates.sort(key=lambda c: (-c["score"], len(c["sentence"])))
+    return candidates
 
 
 def unanswerable(confidence: float = 0.2):
@@ -100,7 +154,11 @@ async def grounded_answer(request: Request):
     logger.info("INCOMING_REQUEST: %s", json.dumps(raw)[:4000])
 
     def respond(payload):
-        logger.info("OUTGOING_RESPONSE for question=%r: %s", raw.get('question') if isinstance(raw, dict) else None, json.dumps(payload))
+        logger.info(
+            "OUTGOING_RESPONSE for question=%r: %s",
+            raw.get("question") if isinstance(raw, dict) else None,
+            json.dumps(payload),
+        )
         return JSONResponse(content=payload)
 
     try:
@@ -114,99 +172,85 @@ async def grounded_answer(request: Request):
     if not question or not chunks:
         return respond(unanswerable(0.0))
 
-    qweights = weighted_keywords(question)
-    if not qweights:
-        # Question had no meaningful (non-stopword) terms to ground against
+    full_qweights = weighted_keywords(question)
+    if not full_qweights:
         return respond(unanswerable(0.0))
-    qwords = set(qweights.keys())
-    total_weight = sum(qweights.values())
 
-    # Build every candidate (chunk_id, sentence, matched_keywords, score) with any overlap
-    candidates = []
-    for chunk in chunks:
-        chunk_id = getattr(chunk, "chunk_id", None)
-        text = getattr(chunk, "text", "") or ""
-        if not chunk_id or not text.strip():
+    entity_tokens = {w for w, wt in full_qweights.items() if wt > 1.0}
+
+    # Try to split into independent sub-questions (e.g. "what year was X
+    # released and who developed it?" -> 2 fragments). If the question
+    # isn't compound, this just returns [question] and behaves as before.
+    fragments = split_question_fragments(question, entity_tokens)
+    fragment_weight_maps = (
+        fragments if isinstance(fragments[0], dict) else [full_qweights]
+    )
+
+    selected = {}   # (chunk_id, sentence) -> candidate dict
+    unsatisfied = False
+
+    for frag_weights in fragment_weight_maps:
+        candidates = build_candidates(frag_weights, chunks)
+        best = candidates[0] if candidates else None
+
+        # Fallback: if the fragment-scoped search comes up short, retry with
+        # the full question's keyword set (covers cases where a fragment's
+        # own wording is too sparse to search on its own).
+        if not best or best["score"] < MATCH_THRESHOLD:
+            fallback_candidates = build_candidates(full_qweights, chunks)
+            fallback_best = fallback_candidates[0] if fallback_candidates else None
+            if fallback_best and fallback_best["score"] >= MATCH_THRESHOLD:
+                best = fallback_best
+                candidates = fallback_candidates
+
+        if not best or best["score"] < MATCH_THRESHOLD:
+            unsatisfied = True
             continue
-        for sent in split_sentences(text):
-            swords = set(tokenize(sent))
-            matched = qwords & swords
-            if matched:
-                weighted_score = sum(qweights[w] for w in matched)
-                candidates.append({
-                    "chunk_id": chunk_id,
-                    "sentence": sent,
-                    "matched": matched,
-                    "score": weighted_score / total_weight,
-                })
 
-    if not candidates:
-        return respond(unanswerable(0.2))
+        key = (best["chunk_id"], best["sentence"])
+        if key not in selected or best["score"] > selected[key]["score"]:
+            selected[key] = best
 
-    # Sort by strength of match (most weighted keyword coverage first, ties
-    # broken by shorter/tighter sentence so we don't drag in extra
-    # unsupported text)
-    candidates.sort(key=lambda c: (-c["score"], len(c["sentence"])))
+        # Also pull in any other sentence from that SAME chunk that clears
+        # a strong bar, so a multi-sentence answer within one chunk isn't
+        # truncated to a single line.
+        for c in candidates:
+            if c["chunk_id"] == best["chunk_id"] and c["score"] >= max(MATCH_THRESHOLD, best["score"] * 0.85):
+                k2 = (c["chunk_id"], c["sentence"])
+                if k2 not in selected:
+                    selected[k2] = c
 
-    # Group candidate sentences by chunk, and score each CHUNK by its best
-    # individual sentence (more precise than aggregating the whole chunk,
-    # since a chunk may contain unrelated sentences too).
-    by_chunk = {}
-    for cand in candidates:
-        cid = cand["chunk_id"]
-        if cid not in by_chunk or cand["score"] > by_chunk[cid]["score"]:
-            by_chunk[cid] = cand
-
-    ranked_chunks = sorted(by_chunk.values(), key=lambda c: -c["score"])
-    top_score = ranked_chunks[0]["score"]
     logger.info(
-        "CHUNK_SCORES: %s",
-        json.dumps([{"chunk_id": c["chunk_id"], "score": round(c["score"], 3), "sentence": c["sentence"][:80]} for c in ranked_chunks])
+        "FRAGMENT_RESULTS: fragments=%d selected=%s unsatisfied=%s",
+        len(fragment_weight_maps),
+        json.dumps([{"chunk_id": cid, "sentence": s[:80]} for cid, s in selected.keys()]),
+        unsatisfied,
     )
 
-    if top_score < 0.34:
+    if not selected:
         return respond(unanswerable(0.2))
 
-    # Primary source: the single best-supported chunk. Pull in every
-    # sentence from THAT chunk (and only that chunk) that also has decent
-    # overlap, so the answer can be a little fuller without ever citing a
-    # chunk that isn't actually the source of the returned text.
-    primary_chunk_id = ranked_chunks[0]["chunk_id"]
-    primary_sentences = [
-        c for c in candidates
-        if c["chunk_id"] == primary_chunk_id and c["score"] >= max(0.34, top_score * 0.5)
-    ]
-    covered = set()
-    for c in primary_sentences:
-        covered |= c["matched"]
-    selected_chunk_ids = [primary_chunk_id]
+    if unsatisfied and len(fragment_weight_maps) > 1:
+        # Part of a compound question had no grounded support anywhere in
+        # the provided chunks -- don't claim a confident, complete answer.
+        return respond(unanswerable(0.3))
 
-    # Only reach for a second chunk if the best single chunk clearly doesn't
-    # cover the question on its own, AND a second chunk is independently a
-    # strong (not incidental) match.
-    if top_score < 0.5 and len(ranked_chunks) > 1:
-        second = ranked_chunks[1]
-        new_info = second["matched"] - covered
-        if second["score"] >= 0.34 and new_info:
-            selected_chunk_ids.append(second["chunk_id"])
-            covered |= second["matched"]
-            second_sentences = [
-                c for c in candidates
-                if c["chunk_id"] == second["chunk_id"] and c["score"] >= max(0.34, second["score"] * 0.5)
-            ]
-            primary_sentences += second_sentences
-
-    # Preserve original sentence order within each cited chunk for readability
-    order_index = {(c["chunk_id"], c["sentence"]): i for i, c in enumerate(candidates)}
-    primary_sentences = sorted(
-        {(c["chunk_id"], c["sentence"]) for c in primary_sentences},
-        key=lambda k: order_index[k]
+    # Order sentences by (chunk order in request, sentence order within chunk)
+    chunk_order = {getattr(c, "chunk_id", None): i for i, c in enumerate(chunks)}
+    ordered = sorted(
+        selected.values(),
+        key=lambda c: (chunk_order.get(c["chunk_id"], 0),)
     )
 
-    answer_text = " ".join(sent for _, sent in primary_sentences)
-    citations = list(dict.fromkeys(selected_chunk_ids))  # ordered, deduped
+    answer_text = " ".join(c["sentence"] for c in ordered)
+    citations = list(dict.fromkeys(c["chunk_id"] for c in ordered))
 
-    coverage_ratio = sum(qweights[w] for w in covered) / total_weight
+    covered = set()
+    for c in ordered:
+        covered |= c["matched"]
+    total_weight = sum(full_qweights.values()) or 1.0
+    coverage_ratio = sum(full_qweights.get(w, 0) for w in covered) / total_weight
+    coverage_ratio = min(coverage_ratio, 1.0)
     confidence = round(min(0.99, 0.5 + 0.49 * coverage_ratio), 2)
 
     return respond({
